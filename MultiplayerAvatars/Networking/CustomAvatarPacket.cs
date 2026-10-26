@@ -5,7 +5,9 @@ namespace MultiplayerAvatars.Networking
 {
     internal class CustomAvatarPacket : MpPacket
     {
-        public string Hash { get; set; } = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+        public const string NoAvatarHash = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+
+        public string Hash { get; set; } = NoAvatarHash;
         public float Scale { get; set; } = 1f;
 
         public override void Serialize(NetDataWriter writer)

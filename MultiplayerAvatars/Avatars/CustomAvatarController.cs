@@ -1,12 +1,10 @@
 using BeatSaber.AvatarCore;
 using CustomAvatar.Avatar;
 using IPA.Utilities;
-using IPA.Utilities.Async;
 using MultiplayerAvatars.Networking;
 using MultiplayerAvatars.Providers;
 using SiraUtil.Logging;
 using System;
-using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
@@ -14,147 +12,205 @@ using Zenject;
 
 namespace MultiplayerAvatars.Avatars
 {
+    // Lives next to the game's AvatarController and swaps the base game avatar for the player's custom avatar.
+    // Dependencies are resolved optionally: a failure here must never break lobby/game setup.
     internal class CustomAvatarController : MonoBehaviour
     {
-        private AvatarSpawner _spawner = null!;
-        private IConnectedPlayer _player = null!;
-        private CustomAvatarManager _manager = null!;
-        private AvatarProviderService _provider = null!;
-        private SiraLog _logger = null!;
-        private IAvatarPoseDataProvider? _poses;
-        private AvatarController? _vanilla;
-        private Transform? _avatarParent;
-        private MultiplayerAvatarInput? _input;
-        private SpawnedAvatar? _spawned;
-        private readonly Dictionary<Renderer, bool> _hiddenRenderers = new();
-        private bool _started;
-        private bool _subscribed;
-        private int _request;
+        private static readonly FieldAccessor<AvatarController, Transform>.Accessor ParentingTransform
+            = FieldAccessor<AvatarController, Transform>.GetAccessor("_parentingTransform");
+        private static readonly FieldAccessor<AvatarController, IAvatarPoseDataProvider>.Accessor PoseDataProvider
+            = FieldAccessor<AvatarController, IAvatarPoseDataProvider>.GetAccessor("_poseDataProvider");
 
+        private CustomAvatarPacket _avatarPacket = new();
+        // Tracked separately because the local player's packet is mutated in place
+        private string? _requestedHash;
+        private SpawnedAvatar? _spawnedAvatar;
+        private MultiplayerAvatarInput? _avatarInput;
+        private Renderer[]? _hiddenRenderers;
+        private int _loadVersion;
+        private bool _started;
+
+        // In gameplay the avatar pose provider doesn't reliably update, so drive the avatar from the
+        // head/saber transforms the game moves for this player instead (lobby avatars keep using pose data)
+        private bool _usePoseControllerTransforms;
+
+        private AvatarController _avatarController = null!;
+        private AvatarSpawner _avatarSpawner = null!;
+        private IConnectedPlayer _connectedPlayer = null!;
+        private CustomAvatarManager _customAvatarManager = null!;
+        private AvatarProviderService _avatarProvider = null!;
+        private IAvatarPoseDataProvider _poseDataProvider = null!;
+        private SiraLog? _logger;
+
+        // SiraLog can't be resolved through DiContainer.TryResolve: SiraUtil names it after the injected type,
+        // which only exists in a regular injection context
         [Inject]
-        public void Construct(AvatarSpawner spawner, IConnectedPlayer player,
-            CustomAvatarManager manager, AvatarProviderService provider, SiraLog logger,
-            [InjectOptional] IAvatarPoseDataProvider? poses)
+        public void Construct(
+            [InjectOptional] AvatarSpawner avatarSpawner,
+            [InjectOptional] IConnectedPlayer connectedPlayer,
+            [InjectOptional] CustomAvatarManager customAvatarManager,
+            [InjectOptional] AvatarProviderService avatarProvider,
+            [InjectOptional] IAvatarPoseDataProvider poseDataProvider,
+            [InjectOptional] SiraLog logger)
         {
-            _spawner = spawner;
-            _player = player;
-            _manager = manager;
-            _provider = provider;
             _logger = logger;
-            _poses = poses;
+            _avatarController = GetComponent<AvatarController>();
+            _avatarSpawner = avatarSpawner;
+            _connectedPlayer = connectedPlayer;
+            _customAvatarManager = customAvatarManager;
+            _avatarProvider = avatarProvider;
+            _poseDataProvider = poseDataProvider;
+            _usePoseControllerTransforms = GetComponent<LobbyAvatarInstaller>() == null && GetComponent<MultiplayerAvatarPoseController>() != null;
+
+            if (_avatarController == null || _avatarSpawner == null || _connectedPlayer == null
+                || _customAvatarManager == null || _avatarProvider == null || _poseDataProvider == null)
+            {
+                Log($"Missing dependencies on '{name}', custom avatar disabled " +
+                    $"(controller={_avatarController != null}, spawner={_avatarSpawner != null}, player={_connectedPlayer != null}, " +
+                    $"manager={_customAvatarManager != null}, provider={_avatarProvider != null}, pose={_poseDataProvider != null})");
+                enabled = false;
+            }
         }
 
         public void Start()
         {
-            // Visual avatars are loaded asynchronously. Use their stable controller and parent.
-            try
+            if (!enabled)
+                return;
+            _started = true;
+            _customAvatarManager.avatarReceived += HandleAvatarReceived;
+            HandleAvatarReceived(_connectedPlayer, _customAvatarManager.GetPlayerAvatarPacket(_connectedPlayer.userId));
+        }
+
+        public void Update()
+        {
+            // The base game avatar loads asynchronously, so keep it hidden while ours is shown
+            if (_spawnedAvatar != null && _hiddenRenderers == null && _avatarController.avatar != null)
             {
-                _vanilla = GetComponent<AvatarController>();
-                if (_poses == null || _vanilla == null)
-                {
-                    _logger.Warn("Custom avatar unavailable: missing pose provider or AvatarController; retaining default avatar.");
-                    return;
-                }
-                _avatarParent = _vanilla.GetField<Transform, AvatarController>("_parentingTransform");
-                if (_avatarParent == null)
-                {
-                    _logger.Warn("Custom avatar unavailable: missing avatar parent; retaining default avatar.");
-                    return;
-                }
-                _started = true;
-                OnEnable();
-            }
-            catch (Exception ex)
-            {
-                _logger.Error($"Custom avatar setup failed; retaining default avatar: {ex}");
+                _hiddenRenderers = _avatarController.avatar.GetComponentsInChildren<Renderer>(true);
+                SetBaseAvatarVisible(false);
             }
         }
 
-        public void OnEnable()
+        public void OnDestroy()
         {
-            if (!_started || _subscribed) return;
-            _input = new MultiplayerAvatarInput(_poses!, _avatarParent!);
-            _manager.avatarReceived += HandleAvatarReceived;
-            _subscribed = true;
-            HandleAvatarReceived(_player, _manager.GetPlayerAvatarPacket(_player.userId));
-        }
-
-        public void OnDisable()
-        {
-            ++_request; // Invalidate any load still in flight.
-            if (_subscribed) _manager.avatarReceived -= HandleAvatarReceived;
-            _subscribed = false;
-            ClearAvatar();
-            _input?.Dispose();
-            _input = null;
+            if (_started)
+                _customAvatarManager.avatarReceived -= HandleAvatarReceived;
+            _loadVersion++;
+            DestroyCustomAvatar();
         }
 
         private void HandleAvatarReceived(IConnectedPlayer player, CustomAvatarPacket packet)
         {
-            if (player.userId != _player.userId) return;
-            int request = ++_request;
-            ClearAvatar();
-            if (packet.Hash == "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF") return;
-            _ = LoadAvatar(packet.Hash, packet.Scale, request);
+            if (CustomAvatarManager.ResolveUserId(player.userId) != CustomAvatarManager.ResolveUserId(_connectedPlayer.userId))
+                return;
+
+            _avatarPacket = packet;
+
+            if (packet.Hash == CustomAvatarPacket.NoAvatarHash)
+            {
+                _requestedHash = null;
+                _loadVersion++;
+                DestroyCustomAvatar();
+                return;
+            }
+
+            if (_requestedHash == packet.Hash)
+            {
+                ApplyScale();
+                return;
+            }
+
+            _requestedHash = packet.Hash;
+            _ = LoadAvatar(packet.Hash, ++_loadVersion);
         }
 
-        private async Task LoadAvatar(string hash, float scale, int request)
+        private async Task LoadAvatar(string hash, int version)
         {
             try
             {
-                var prefab = await _provider.GetAvatarByHash(hash, CancellationToken.None);
-                await UnityMainThreadTaskScheduler.Factory.StartNew(() =>
+                var avatarPrefab = await _avatarProvider.GetAvatarByHash(hash, CancellationToken.None);
+                if (version != _loadVersion || this == null)
+                    return;
+                if (avatarPrefab == null)
                 {
-                    if (this == null || !isActiveAndEnabled || request != _request) return;
-                    if (prefab == null)
-                    {
-                        _logger.Warn($"Failed to load avatar {hash}; retaining default avatar.");
-                        return;
-                    }
-                    try
-                    {
-                        _spawned = _spawner.SpawnAvatar(prefab, _input!, _avatarParent!);
-                        var ik = _spawned.GetComponent<AvatarIK>();
-                        if (ik != null) ik.isLocomotionEnabled = true;
-                        _spawned.transform.localScale = Vector3.one * scale;
-                        LateUpdate();
-                    }
-                    catch
-                    {
-                        ClearAvatar();
-                        throw;
-                    }
-                });
+                    _logger?.Warn($"Could not find avatar '{hash}' for player '{_connectedPlayer.userName}'");
+                    return;
+                }
+
+                CreateAvatar(avatarPrefab);
             }
             catch (Exception ex)
             {
-                _logger.Error($"Custom avatar load failed for {hash}: {ex}");
+                _logger?.Error($"Failed to load avatar '{hash}' for player '{_connectedPlayer.userName}': {ex.Message}");
+                _logger?.Debug(ex);
+                DestroyCustomAvatar();
             }
         }
 
-        public void LateUpdate()
+        private void CreateAvatar(AvatarPrefab avatar)
         {
-            // The default visual may finish loading after our custom avatar.
-            if (_spawned == null || _vanilla == null || _vanilla.avatar == null) return;
-            foreach (var renderer in _vanilla.avatar.GetComponentsInChildren<Renderer>(true))
+            DestroyCustomAvatar();
+
+            // In gameplay the parenting transform carries a timeline-driven Animator that breaks the custom avatar's IK,
+            // so spawn next to it instead; the IK targets are world-space transforms either way.
+            // Elsewhere (e.g. the big hologram avatar, which scales its container) stay inside it.
+            var parent = ParentingTransform(ref _avatarController);
+            if (parent == null || parent.GetComponent<Animator>() != null)
+                parent = _avatarController.transform;
+            _avatarInput = _usePoseControllerTransforms
+                ? MultiplayerAvatarInput.FromPoseController(avatar, GetComponent<MultiplayerAvatarPoseController>(), MirrorPoseDataProvider.IsMirroring(gameObject))
+                : null;
+            if (_usePoseControllerTransforms && _avatarInput == null)
+                _logger?.Warn($"No usable {nameof(MultiplayerAvatarPoseController)} on '{name}', falling back to pose data");
+            if (_avatarInput == null)
             {
-                if (!_hiddenRenderers.ContainsKey(renderer))
-                    _hiddenRenderers.Add(renderer, renderer.enabled);
-                renderer.enabled = false;
+                // MultiplayerMirror swaps the controller's pose provider after creation, so use whatever it holds now
+                var poseDataProvider = PoseDataProvider(ref _avatarController) ?? _poseDataProvider;
+                _avatarInput = new MultiplayerAvatarInput(avatar, poseDataProvider, parent, MirrorPoseDataProvider.GetSwapHands(poseDataProvider));
             }
+            _spawnedAvatar = _avatarSpawner.SpawnAvatar(avatar, _avatarInput, parent);
+            var avatarIk = _spawnedAvatar.GetComponent<AvatarIK>();
+            if (avatarIk != null)
+                avatarIk.isLocomotionEnabled = true;
+            ApplyScale();
+            _logger?.Debug($"Spawned avatar '{avatar.descriptor.name}' for player '{_connectedPlayer.userName}' " +
+                $"into '{parent.name}' (poseControllerTransforms={_usePoseControllerTransforms})");
         }
 
-        private void ClearAvatar()
+        private void ApplyScale()
         {
-            if (_spawned != null)
-            {
-                _spawned.gameObject.SetActive(false);
-                Destroy(_spawned.gameObject);
-                _spawned = null;
-            }
-            foreach (var entry in _hiddenRenderers)
-                if (entry.Key != null) entry.Key.enabled = entry.Value;
-            _hiddenRenderers.Clear();
+            var scale = _avatarPacket.Scale > 0f ? _avatarPacket.Scale : 1f;
+            if (_spawnedAvatar != null)
+                _spawnedAvatar.transform.localScale = Vector3.one * scale;
+            _avatarInput?.SetScale(scale);
+        }
+
+        private void DestroyCustomAvatar()
+        {
+            if (_spawnedAvatar != null)
+                Destroy(_spawnedAvatar.gameObject);
+            _spawnedAvatar = null;
+            _avatarInput?.Dispose();
+            _avatarInput = null;
+            SetBaseAvatarVisible(true);
+            _hiddenRenderers = null;
+        }
+
+        private void SetBaseAvatarVisible(bool visible)
+        {
+            if (_hiddenRenderers == null)
+                return;
+            foreach (var renderer in _hiddenRenderers)
+                if (renderer != null)
+                    renderer.enabled = visible;
+        }
+
+        private void Log(string message)
+        {
+            if (_logger != null)
+                _logger.Warn(message);
+            else
+                Plugin.Logger.Warn(message);
         }
     }
 }

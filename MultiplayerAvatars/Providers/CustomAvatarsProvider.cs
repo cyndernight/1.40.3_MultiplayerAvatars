@@ -1,5 +1,6 @@
 ﻿using CustomAvatar.Avatar;
 using CustomAvatar.Player;
+using IPA.Utilities.Async;
 using MultiplayerAvatars.Providers.Abstractions;
 using MultiplayerAvatars.Providers.Attributes;
 using SiraUtil.Logging;
@@ -39,11 +40,12 @@ namespace MultiplayerAvatars.Providers
         {
             try
             {
-                await _updateAvatarHashes.ConfigureAwait(false);
+                await _updateAvatarHashes;
                 if (!_cachedAvatarPaths.TryGetValue(hash, out string path))
                     return null;
 
-                return await _avatarLoader.LoadFromFileAsync(path, null, cancellationToken);
+                // Asset bundles must be loaded from the main thread
+                return await UnityMainThreadTaskScheduler.Factory.StartNew(() => _avatarLoader.LoadFromFileAsync(path, null, cancellationToken)).Unwrap();
             }
             catch (Exception ex)
             {
@@ -55,7 +57,7 @@ namespace MultiplayerAvatars.Providers
 
         public async Task<string?> GetAvatarHash(string path)
         {
-            await _updateAvatarHashes.ConfigureAwait(false);
+            await _updateAvatarHashes;
             if (!_cachedAvatarHashes.ContainsKey(path))
                 return null;
             return _cachedAvatarHashes[path];
@@ -63,10 +65,10 @@ namespace MultiplayerAvatars.Providers
 
         public void AddAvatar(string path, string hash)
         {
+            _cachedAvatarHashes[path] = hash;
             if (_cachedAvatarPaths.ContainsKey(hash))
                 return;
             _cachedAvatarPaths[hash] = path;
-            _cachedAvatarHashes[path] = hash;
         }
 
         public void AddAvatar(string path)
@@ -74,10 +76,10 @@ namespace MultiplayerAvatars.Providers
             using (var fs = File.OpenRead(path))
             {
                 string hash = BitConverter.ToString(MD5.Create().ComputeHash(fs)).Replace("-", "");
+                _cachedAvatarHashes[path] = hash;
                 if (_cachedAvatarPaths.ContainsKey(hash))
                     return;
                 _cachedAvatarPaths[hash] = path;
-                _cachedAvatarHashes[path] = hash;
             }
         }
 

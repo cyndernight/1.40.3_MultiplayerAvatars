@@ -64,8 +64,17 @@ namespace MultiplayerAvatars.Networking
             _packetSerializer.UnregisterCallback<CustomAvatarPacket>();
         }
 
+        // MultiplayerMirror shows the local player through a mock player with a prefixed user id
+        private const string MirrorUserIdPrefix = "Mirror#";
+
+        public static string ResolveUserId(string userId)
+            => userId.StartsWith(MirrorUserIdPrefix) ? userId.Substring(MirrorUserIdPrefix.Length) : userId;
+
         public CustomAvatarPacket GetPlayerAvatarPacket(string userId)
         {
+            userId = ResolveUserId(userId);
+            if (userId == _sessionManager.localPlayer?.userId)
+                return _localPlayerAvatar;
             if (!_connectedPlayerAvatars.ContainsKey(userId))
                 return new();
             return _connectedPlayerAvatars[userId];
@@ -77,6 +86,7 @@ namespace MultiplayerAvatars.Networking
             {
                 _localPlayerAvatar = new();
                 _sessionManager.Send(_localPlayerAvatar);
+                NotifyLocalAvatarChanged();
                 return;
             }
 
@@ -87,6 +97,15 @@ namespace MultiplayerAvatars.Networking
         {
             _localPlayerAvatar.Scale = scale;
             _sessionManager.Send(_localPlayerAvatar);
+            NotifyLocalAvatarChanged();
+        }
+
+        // Lets local player avatars (results pedestal, lobby mirror) follow avatar changes
+        private void NotifyLocalAvatarChanged()
+        {
+            var localPlayer = _sessionManager.localPlayer;
+            if (localPlayer != null)
+                avatarReceived?.Invoke(localPlayer, _localPlayerAvatar);
         }
 
         private void HandleCustomAvatarPacket(CustomAvatarPacket packet, IConnectedPlayer player)
@@ -115,7 +134,7 @@ namespace MultiplayerAvatars.Networking
 
             var path = System.IO.Path.Combine(PlayerAvatarManager.kCustomAvatarsPath, fileName);
 
-            _ = Task.Run(() => UpdateAvatarHash(path));
+            _ = UpdateAvatarHash(path);
         }
 
         private async Task UpdateAvatarHash(string path)
@@ -129,6 +148,7 @@ namespace MultiplayerAvatars.Networking
 
             _localPlayerAvatar.Hash = hash;
             _sessionManager.Send(_localPlayerAvatar);
+            NotifyLocalAvatarChanged();
         }
     }
 }

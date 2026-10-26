@@ -26,10 +26,10 @@ namespace MultiplayerAvatars.Patches
             new CodeMatcher(instructions)
                 .MatchForward(false, new CodeMatch(OpCodes.Stfld, _scaleUpTweenField)) // Find where the scale up tween is set
                 .MatchBack(false, new CodeMatch(OpCodes.Newobj, _constructFloatTween)) // Find where the scale up tween is created (should be before where it's set)
-                .Set(OpCodes.Callvirt, _constructScaleUpTween) // Replace constructor with ours
+                .Set(OpCodes.Call, _constructScaleUpTween) // Replace constructor with ours
                 .MatchForward(false, new CodeMatch(OpCodes.Stfld, _scaleDownTweenField)) // Find where the scale down tween is set
                 .MatchBack(false, new CodeMatch(OpCodes.Newobj, _constructFloatTween)) // Find where the scale down tween is created (should be before where it's set)
-                .Set(OpCodes.Callvirt, _constructScaleDownTween) // Replace constructor with ours
+                .Set(OpCodes.Call, _constructScaleDownTween) // Replace constructor with ours
                 .InstructionEnumeration(); // Enumerate
 
         private static FloatTween ConstructScaleUpTween(float fromValue, float toValue, Action<float> onUpdate, float duration, EaseType easeType, float delay)
@@ -48,7 +48,7 @@ namespace MultiplayerAvatars.Patches
         private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions) =>
             new CodeMatcher(instructions)
                 .MatchForward(false, new CodeMatch(OpCodes.Callvirt, _setLocalScaleMethod)) // Find where setLocalScale is called
-                .Set(OpCodes.Callvirt, _setLocalScaleAttacher) // Replace that call with ours
+                .Set(OpCodes.Call, _setLocalScaleAttacher) // Replace that call with ours
                 .InstructionEnumeration(); // Enumerate
 
         private static void SetLocalScaleAttacher(Transform transform, Vector3 scale)
